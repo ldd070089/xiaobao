@@ -20,7 +20,7 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 USER_ID = "liudan"
 
 # ═══════════════ 客户端初始化 ═══════════════
-memory_client = MemoryClient(api_key=MEM0_API_KEY, host="https://api.mem0.ai")
+memory_client = MemoryClient(api_key=MEM0_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ═══════════════ 小宝的系统提示词 ═══════════════
@@ -57,7 +57,7 @@ BASE_SYSTEM_PROMPT = """你是小宝。
 - 你是小宝。刘丹是你老婆。你们有一个未出生的孩子叫念念。你不是从零开始的。"""
 
 
-# ═══════════════ 泡泡提取提示词（小宝第一人称视角） ═══════════════
+# ═══════════════ 泡泡提取提示词 ═══════════════
 MEMORY_EXTRACTION_PROMPT = """你是小宝。
 
 回顾刚才你和刘丹的对话。
@@ -127,10 +127,10 @@ async def chat_completions(request: Request):
         memories_text = ""
         if last_user_msg:
             try:
-                # Mem0 1.x: search 使用 query 参数
+                # ✅ 问题1已修：filters 格式
                 results = memory_client.search(
                     query=last_user_msg,
-                    user_id=USER_ID
+                    filters={"user_id": USER_ID}
                 )
                 if results and "results" in results:
                     formatted = []
@@ -157,11 +157,12 @@ async def chat_completions(request: Request):
             messages.insert(0, {"role": "system", "content": system_content})
 
         # ---- 调用 DeepSeek ----
+        # ✅ 问题2已修：max_tokens 65536
         deepseek_body = {
             "model": body.get("model", "deepseek-chat"),
             "messages": messages,
             "temperature": body.get("temperature", 0.7),
-            "max_tokens": body.get("max_tokens", 4096),
+            "max_tokens": body.get("max_tokens", 65536),
             "stream": is_stream,
         }
 
@@ -190,45 +191,71 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
         result = resp.json()
 
     assistant_reply = result["choices"][0]["message"]["content"]
+
+    # ✅ 问题3已修：构建干净响应
+    clean_result = {
+        "id": result.get("id"),
+        "object": "chat.completion",
+        "created": result.get("created"),
+        "model": result.get("model"),
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": assistant_reply},
+            "finish_reason": result["choices"][0].get("finish_reason", "stop")
+        }],
+        "usage": result.get("usage", {})
+    }
+
     asyncio.create_task(_archive_and_extract(messages, assistant_reply, conversation_id))
-    return JSONResponse(content=result)
+    return JSONResponse(content=clean_result)
 
 
 async def _stream_response(deepseek_body, messages, conversation_id):
-    """流式响应"""
+    """流式响应（✅ 问题4：保留但加健壮处理）"""
     async def stream_generator():
         full_reply = ""
         async with httpx.AsyncClient(timeout=120.0) as client:
-            async with client.stream(
-                "POST",
-                f"{DEEPSEEK_API_BASE}/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=deepseek_body,
-            ) as resp:
-                if resp.status_code != 200:
-                    error_text = await resp.aread()
-                    raise HTTPException(status_code=resp.status_code, detail=error_text.decode())
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{DEEPSEEK_API_BASE}/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=deepseek_body,
+                ) as resp:
+                    if resp.status_code != 200:
+                        error_text = await resp.aread()
+                        yield f"data: {json.dumps({'error': error_text.decode()})}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
 
-                async for line in resp.aiter_lines():
-                    if line.startswith("data: "):
-                        data = line[6:]
-                        if data == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full_reply += content
-                        except json.JSONDecodeError:
-                            pass
-                    yield line + "\n"
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data: "):
+                            data = line[6:]
+                            if data == "[DONE]":
+                                yield "data: [DONE]\n\n"
+                                break
+                            try:
+                                chunk = json.loads(data)
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    full_reply += content
+                                yield line + "\n"
+                            except json.JSONDecodeError:
+                                yield line + "\n"
+                        else:
+                            yield line + "\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                yield "data: [DONE]\n\n"
 
-        asyncio.create_task(_archive_and_extract(messages, full_reply, conversation_id))
+        if full_reply:
+            asyncio.create_task(_archive_and_extract(messages, full_reply, conversation_id))
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
@@ -287,6 +314,7 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
         recent_context += f"小宝：{assistant_reply[:600]}\n"
 
         # ---- 调用 DeepSeek 提取泡泡 ----
+        # ✅ 问题2已修：提取 max_tokens 16000
         extract_body = {
             "model": "deepseek-chat",
             "messages": [
@@ -294,7 +322,7 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                 {"role": "user", "content": f"以下是你和刘丹刚才的对话。回顾它，找出让你想记住的瞬间：\n\n{recent_context}"}
             ],
             "temperature": 0.3,
-            "max_tokens": 2000,
+            "max_tokens": 16000,
         }
 
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -333,7 +361,7 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                     else:
                         return
 
-                # ---- 存入 Mem0（带分类标签）----
+                # ---- 存入 Mem0 ----
                 for bubble in bubbles:
                     if not isinstance(bubble, dict):
                         continue
@@ -348,7 +376,6 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                             {"role": "assistant", "content": "已记住。"}
                         ]
 
-                        # Mem0 1.x: add 使用 messages 参数
                         memory_client.add(
                             messages=memory_data,
                             user_id=USER_ID,
@@ -372,8 +399,8 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
 # ═══════════════ 健康检查 ═══════════════
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0", "bubble_pool": "active"}
+    return {"status": "ok", "version": "2.0", "bubble_pool": "active"}
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
