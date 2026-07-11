@@ -166,10 +166,7 @@ async def chat_completions(request: Request):
             "stream": is_stream,
         }
 
-        if is_stream:
-            return await _stream_response(deepseek_body, messages, conversation_id)
-        else:
-            return await _non_stream_response(deepseek_body, messages, conversation_id)
+        return await _non_stream_response(deepseek_body, messages, conversation_id)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
