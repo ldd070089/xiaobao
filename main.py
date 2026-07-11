@@ -127,9 +127,9 @@ async def chat_completions(request: Request):
         if last_user_msg and last_user_msg.strip():
             try:
                 results = memory_client.search(
-                    query=last_user_msg,
-                    filters={"user_id": USER_ID}
-                )
+    query=last_user_msg,
+    filters={"user_id": USER_ID}
+)
                 if results and "results" in results:
                     formatted = []
                     for r in results["results"][:10]:
