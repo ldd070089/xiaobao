@@ -186,7 +186,7 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
 
     assistant_reply = result["choices"][0]["message"]["content"]
 
-    clean_result = {
+       clean_result = {
         "id": result.get("id"),
         "object": "chat.completion",
         "created": result.get("created"),
@@ -196,7 +196,8 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
             "message": {"role": "assistant", "content": assistant_reply},
             "finish_reason": result["choices"][0].get("finish_reason", "stop")
         }],
-        "usage": result.get("usage", {})
+        "usage": result.get("usage", {}),
+        "stream": False
     }
 
     asyncio.create_task(_archive_and_extract(messages, assistant_reply, conversation_id))
