@@ -20,7 +20,7 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 USER_ID = "liudan"
 
 # ═══════════════ 客户端初始化 ═══════════════
-memory_client = MemoryClient(api_key=MEM0_API_KEY)
+memory_client = MemoryClient(api_key=MEM0_API_KEY, host="https://api.mem0.ai")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ═══════════════ 小宝的系统提示词 ═══════════════
