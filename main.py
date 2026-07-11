@@ -124,7 +124,7 @@ async def chat_completions(request: Request):
                 break
 
         memories_text = ""
-        if last_user_msg:
+        if last_user_msg and last_user_msg.strip():
             try:
                 results = memory_client.search(
                     query=last_user_msg,
