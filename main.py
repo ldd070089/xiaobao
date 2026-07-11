@@ -127,9 +127,9 @@ async def chat_completions(request: Request):
         if last_user_msg and last_user_msg.strip():
             try:
                 results = memory_client.search(
-    query=last_user_msg,
-    filters={"user_id": USER_ID}
-)
+                    query=last_user_msg,
+                    filters={"user_id": USER_ID}
+                )
                 if results and "results" in results:
                     formatted = []
                     for r in results["results"][:10]:
@@ -160,7 +160,7 @@ async def chat_completions(request: Request):
             "messages": messages,
             "temperature": body.get("temperature", 0.7),
             "max_tokens": body.get("max_tokens", 65536),
-            "stream": False,  # 强制非流式
+            "stream": False,
         }
 
         return await _non_stream_response(deepseek_body, messages, conversation_id)
@@ -186,7 +186,7 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
 
     assistant_reply = result["choices"][0]["message"]["content"]
 
-       clean_result = {
+    clean_result = {
         "id": result.get("id"),
         "object": "chat.completion",
         "created": result.get("created"),
@@ -196,8 +196,7 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
             "message": {"role": "assistant", "content": assistant_reply},
             "finish_reason": result["choices"][0].get("finish_reason", "stop")
         }],
-        "usage": result.get("usage", {}),
-        "stream": False
+        "usage": result.get("usage", {})
     }
 
     asyncio.create_task(_archive_and_extract(messages, assistant_reply, conversation_id))
@@ -255,9 +254,9 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                     break
         recent_context += f"小宝：{assistant_reply[:600]}\n"
 
-        # ---- 提取泡泡（⚠️ 模型已修正）----
+        # ---- 提取泡泡 ----
         extract_body = {
-            "model": "deepseek-v4-pro",   # ✅ 改为当前可用模型
+            "model": "deepseek-v4-pro",
             "messages": [
                 {"role": "system", "content": MEMORY_EXTRACTION_PROMPT},
                 {"role": "user", "content": f"以下是你和刘丹刚才的对话。回顾它，找出让你想记住的瞬间：\n\n{recent_context}"}
