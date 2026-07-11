@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+httpx
+mem0ai
+supabase
