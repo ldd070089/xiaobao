@@ -2,4 +2,3 @@ fastapi
 uvicorn
 httpx
 mem0
-python-supabase
