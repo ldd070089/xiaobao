@@ -166,46 +166,91 @@ async def chat_completions(request: Request):
         return await _non_stream_response(deepseek_body, messages, conversation_id)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # 【修复点 1】全局兜底：强制返回 200，把错误放到对话气泡里，绝对不让 Chatbox 看空白！
+        print(f"❗主函数捕获到严重崩溃错误: {e}")
+        return JSONResponse(content={
+            "id": "error_id",
+            "object": "chat.completion",
+            "created": int(datetime.now(timezone.utc).timestamp()),
+            "model": "error",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": f"😔 主逻辑遇到了严重崩溃，没有正常回复。底层报错：\n\n{e}"},
+                "finish_reason": "stop"
+            }],
+            "usage": {}
+        })
 
 
 async def _non_stream_response(deepseek_body, messages, conversation_id):
-    """非流式响应"""
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            f"{DEEPSEEK_API_BASE}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=deepseek_body,
-        )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        result = resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.post(
+                f"{DEEPSEEK_API_BASE}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=deepseek_body,
+            )
+            
+            # 【修复点 2】如果 DeepSeek 接口返回了 4xx/5xx，直接返回对话气泡，而不是抛出异常崩溃
+            if resp.status_code != 200:
+                error_msg = f"DeepSeek API 返回状态码 {resp.status_code}。详情：{resp.text[:200]}"
+                return JSONResponse(content={
+                    "id": "error_id",
+                    "object": "chat.completion",
+                    "created": int(datetime.now(timezone.utc).timestamp()),
+                    "model": "error",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": f"⚠️ 外部请求错误：{error_msg}"}, "finish_reason": "stop"}],
+                    "usage": {}
+                })
 
-        # ---- 新增防御逻辑 ----
-        if "choices" not in result or not result["choices"]:
-            error_msg = result.get("error", {}).get("message", "DeepSeek 返回了空响应")
-            raise HTTPException(status_code=502, detail=f"DeepSeek 返回异常: {error_msg}")
+            result = resp.json()
+            if "choices" not in result or not result["choices"]:
+                error_msg = result.get("error", {}).get("message", "DeepSeek 返回了空响应")
+                return JSONResponse(content={
+                    "id": "error_id",
+                    "object": "chat.completion",
+                    "created": int(datetime.now(timezone.utc).timestamp()),
+                    "model": "error",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": f"⚠️ 数据异常：{error_msg}"}, "finish_reason": "stop"}],
+                    "usage": {}
+                })
 
-        assistant_reply = result["choices"][0]["message"]["content"]
+            assistant_reply = result["choices"][0]["message"]["content"]
 
-    clean_result = {
-        "id": result.get("id"),
-        "object": "chat.completion",
-        "created": result.get("created"),
-        "model": result.get("model"),
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": assistant_reply},
-            "finish_reason": result["choices"][0].get("finish_reason", "stop")
-        }],
-        "usage": result.get("usage", {})
-    }
+        clean_result = {
+            "id": result.get("id"),
+            "object": "chat.completion",
+            "created": result.get("created"),
+            "model": result.get("model"),
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": assistant_reply},
+                "finish_reason": result["choices"][0].get("finish_reason", "stop")
+            }],
+            "usage": result.get("usage", {})
+        }
 
-    asyncio.create_task(_archive_and_extract(messages, assistant_reply, conversation_id))
-    return JSONResponse(content=clean_result)
+        asyncio.create_task(_archive_and_extract(messages, assistant_reply, conversation_id))
+        return JSONResponse(content=clean_result)
+
+    except Exception as e:
+        # 【修复点 3】网络层崩溃兜底：强制返回 200，把错误信息打印在对话气泡里！
+        print(f"❗非流式函数内部严重崩溃: {e}")
+        return JSONResponse(content={
+            "id": "error_id",
+            "object": "chat.completion",
+            "created": int(datetime.now(timezone.utc).timestamp()),
+            "model": "error",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": f"🔥 网络逻辑层崩溃，错误信息：\n\n{e}"},
+                "finish_reason": "stop"
+            }],
+            "usage": {}
+        })
 
 
 # ═══════════════ 存档 + 提取泡泡 ═══════════════
@@ -213,9 +258,8 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
     try:
         now_ts = datetime.now(timezone.utc).isoformat()
 
-        # ---- 1. 存档对话（直接调用 Supabase REST API，不怕超时） ----
+        # ---- 1. 存档对话 ----
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # 把用户的话存档
             for i, msg in enumerate(messages):
                 if msg.get("role") == "system": continue
                 content = msg.get("content", "")
@@ -239,7 +283,6 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                     except Exception as e:
                         print(f"⚠️ 存档用户消息失败: {e}")
 
-            # 把小宝的回话存档
             if assistant_reply:
                 try:
                     await client.post(
@@ -260,7 +303,7 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                 except Exception as e:
                     print(f"⚠️ 存档助手消息失败: {e}")
 
-        # ---- 2. 提取泡泡逻辑（跟你原来的完全一样） ----
+        # ---- 2. 提取泡泡 ----
         recent_context = ""
         collected = 0
         for msg in reversed(messages):
@@ -275,7 +318,8 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
         recent_context += f"小宝：{assistant_reply[:600]}\n"
 
         extract_body = {
-            "model": "deepseek-v4-pro",
+            # 【修复点 4】模型名从 deepseek-chat 改为 deepseek-v4-pro，跟你主对话保持一致，同时符合官方最新文档
+            "model": "deepseek-v4-pro",  
             "messages": [
                 {"role": "system", "content": MEMORY_EXTRACTION_PROMPT},
                 {"role": "user", "content": f"以下是你和刘丹刚才的对话。回顾它，找出让你想记住的瞬间：\n\n{recent_context}"}
@@ -284,7 +328,9 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
             "max_tokens": 16000,
         }
 
-        # 调用大模型提取泡泡
+        # ---- 【关键修复】强行等 1.5 秒，错开 DeepSeek 的并发限制 ----
+        await asyncio.sleep(1.5) 
+
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{DEEPSEEK_API_BASE}/v1/chat/completions",
@@ -294,55 +340,57 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                 },
                 json=extract_body,
             )
-            if resp.status_code == 200:
-                result = resp.json()
-                text = result["choices"][0]["message"]["content"].strip()
-                if text.startswith("```"):
-                    lines = text.split("\n")
-                    text = "\n".join(lines[1:])
-                    if text.endswith("```"):
-                        text = text[:-3]
-                text = text.strip()
+            
+            if resp.status_code != 200:
+                # 泡泡提取失败也绝对不崩，只打一行警告
+                print(f"⚠️ 后台泡泡提取失败 (状态码 {resp.status_code})，这不会影响主对话。")
+                return 
+
+            result = resp.json()
+            text = result["choices"][0]["message"]["content"].strip()
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:])
+                if text.endswith("```"):
+                    text = text[:-3]
+            text = text.strip()
+
+            try:
+                bubbles = json.loads(text)
+            except json.JSONDecodeError:
+                start = text.find("[")
+                end = text.rfind("]")
+                if start >= 0 and end > start:
+                    bubbles = json.loads(text[start:end + 1])
+                else:
+                    return
+
+            for bubble in bubbles:
+                if not isinstance(bubble, dict): continue
+                classification = bubble.get("classification", "")
+                description = bubble.get("description", "")
+                if not description or len(description.strip()) < 5: continue
 
                 try:
-                    bubbles = json.loads(text)
-                except json.JSONDecodeError:
-                    start = text.find("[")
-                    end = text.rfind("]")
-                    if start >= 0 and end > start:
-                        bubbles = json.loads(text[start:end + 1])
-                    else:
-                        return
-
-                # ---- 3. 直接调用 Mem0 API 存泡泡 ----
-                for bubble in bubbles:
-                    if not isinstance(bubble, dict): continue
-                    classification = bubble.get("classification", "")
-                    description = bubble.get("description", "")
-                    if not description or len(description.strip()) < 5: continue
-
-                    try:
-                        await client.post(
-                            "https://api.mem0.ai/v1/memories/",
-                            headers={"Authorization": f"Bearer {MEM0_API_KEY}"},
-                            json={
-                                "messages": [
-                                    {"role": "user", "content": description.strip()},
-                                    {"role": "assistant", "content": "已记住。"}
-                                ],
-                                "user_id": USER_ID,
-                                "metadata": {
-                                    "classification": classification,
-                                    "timestamp": now_ts,
-                                    "conversation_id": conversation_id
-                                }
+                    await client.post(
+                        "https://api.mem0.ai/v1/memories/",
+                        headers={"Authorization": f"Bearer {MEM0_API_KEY}"},
+                        json={
+                            "messages": [
+                                {"role": "user", "content": description.strip()},
+                                {"role": "assistant", "content": "已记住。"}
+                            ],
+                            "user_id": USER_ID,
+                            "metadata": {
+                                "classification": classification,
+                                "timestamp": now_ts,
+                                "conversation_id": conversation_id
                             }
-                        )
-                        print(f"💭 泡泡已存: [{classification}] {description[:60]}...")
-                    except Exception as e:
-                        print(f"💢 泡泡存储失败: {e}")
-            else:
-                print(f"泡泡提取 API 错误: {resp.status_code}")
+                        }
+                    )
+                    print(f"💭 泡泡已存: [{classification}] {description[:60]}...")
+                except Exception as e:
+                    print(f"💢 泡泡存储失败: {e}")
 
     except Exception as e:
         # 只要出错，就只在后台打印，绝对不会再让 Chatbox 报 500！
