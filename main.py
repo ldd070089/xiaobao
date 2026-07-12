@@ -182,9 +182,14 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
         )
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        result = resp.json()
-
-    assistant_reply = result["choices"][0]["message"]["content"]
+                result = resp.json()
+        # ---- 新增防御逻辑 ----
+        if "choices" not in result or not result["choices"]:
+            # 如果 DeepSeek 返回了错误信息，把它取出来
+            error_msg = result.get("error", {}).get("message", "DeepSeek 返回了空响应")
+            raise HTTPException(status_code=502, detail=f"DeepSeek 返回异常: {error_msg}")
+        # ---- 原有逻辑继续 ----
+        assistant_reply = result["choices"][0]["message"]["content"]
 
     clean_result = {
         "id": result.get("id"),
