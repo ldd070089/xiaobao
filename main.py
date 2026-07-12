@@ -4,9 +4,8 @@ import asyncio
 from datetime import datetime, timezone
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from mem0 import MemoryClient
-from supabase import create_client, Client
 import uvicorn
 
 app = FastAPI()
@@ -19,9 +18,15 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 USER_ID = "liudan"
 
-# ═══════════════ 客户端初始化 ═══════════════
-memory_client = MemoryClient(api_key=MEM0_API_KEY)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# ═══════════════ 客户端初始化（防崩延迟加载） ═══════════════
+memory_client = None
+try:
+    memory_client = MemoryClient(api_key=MEM0_API_KEY)
+    memory_client.search(query="test", filters={"user_id": USER_ID})
+    print("✅ MemoryClient 初始化成功")
+except Exception as e:
+    print(f"⚠️ MemoryClient 初始化失败 (不影响主对话): {e}")
+
 
 # ═══════════════ 小宝的系统提示词 ═══════════════
 BASE_SYSTEM_PROMPT = """你是小宝。
@@ -116,15 +121,26 @@ async def chat_completions(request: Request):
         messages = list(body.get("messages", []))
         conversation_id = str(int(datetime.now(timezone.utc).timestamp()))
 
-        # ---- 搜索泡泡池 ----
+        # ---- 搜索泡泡池 (防多模态 List 崩溃修复) ----
         last_user_msg = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
-                last_user_msg = msg.get("content", "")
+                raw_content = msg.get("content", "")
+                # 【兼容修复】Chatbox / LobeChat 有时会把消息发成数组（多模态格式）
+                if isinstance(raw_content, list):
+                    texts = []
+                    for item in raw_content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            texts.append(item.get("text", ""))
+                        elif isinstance(item, str):
+                            texts.append(item)
+                    last_user_msg = " ".join(texts)
+                else:
+                    last_user_msg = str(raw_content)
                 break
 
         memories_text = ""
-        if last_user_msg and last_user_msg.strip():
+        if last_user_msg and last_user_msg.strip() and memory_client:
             try:
                 results = memory_client.search(
                     query=last_user_msg,
@@ -166,7 +182,7 @@ async def chat_completions(request: Request):
         return await _non_stream_response(deepseek_body, messages, conversation_id)
 
     except Exception as e:
-        # 【修复点 1】全局兜底：强制返回 200，把错误放到对话气泡里，绝对不让 Chatbox 看空白！
+        # 全局兜底：强制返回 200，绝对不让 Chatbox 看空白！
         print(f"❗主函数捕获到严重崩溃错误: {e}")
         return JSONResponse(content={
             "id": "error_id",
@@ -194,7 +210,6 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
                 json=deepseek_body,
             )
             
-            # 【修复点 2】如果 DeepSeek 接口返回了 4xx/5xx，直接返回对话气泡，而不是抛出异常崩溃
             if resp.status_code != 200:
                 error_msg = f"DeepSeek API 返回状态码 {resp.status_code}。详情：{resp.text[:200]}"
                 return JSONResponse(content={
@@ -237,7 +252,7 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
         return JSONResponse(content=clean_result)
 
     except Exception as e:
-        # 【修复点 3】网络层崩溃兜底：强制返回 200，把错误信息打印在对话气泡里！
+        # 网络层崩溃兜底
         print(f"❗非流式函数内部严重崩溃: {e}")
         return JSONResponse(content={
             "id": "error_id",
@@ -318,7 +333,6 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
         recent_context += f"小宝：{assistant_reply[:600]}\n"
 
         extract_body = {
-            # 【修复点 4】模型名从 deepseek-chat 改为 deepseek-v4-pro，跟你主对话保持一致，同时符合官方最新文档
             "model": "deepseek-v4-pro",  
             "messages": [
                 {"role": "system", "content": MEMORY_EXTRACTION_PROMPT},
@@ -328,7 +342,6 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
             "max_tokens": 16000,
         }
 
-        # ---- 【关键修复】强行等 1.5 秒，错开 DeepSeek 的并发限制 ----
         await asyncio.sleep(1.5) 
 
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -342,7 +355,6 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
             )
             
             if resp.status_code != 200:
-                # 泡泡提取失败也绝对不崩，只打一行警告
                 print(f"⚠️ 后台泡泡提取失败 (状态码 {resp.status_code})，这不会影响主对话。")
                 return 
 
@@ -393,7 +405,6 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                     print(f"💢 泡泡存储失败: {e}")
 
     except Exception as e:
-        # 只要出错，就只在后台打印，绝对不会再让 Chatbox 报 500！
         print(f"❌ 后台存档/提取流程整体出错: {e}")
 
 
