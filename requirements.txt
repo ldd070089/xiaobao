@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 httpx
-mem0ai
-supabase
+mem0
+python-supabase
