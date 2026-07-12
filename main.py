@@ -213,53 +213,67 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
     try:
         now_ts = datetime.now(timezone.utc).isoformat()
 
-        # ---- 存档对话 ----
-        msg_index = 0
-        for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                continue
-            if content:
+        # ---- 1. 存档对话（直接调用 Supabase REST API，不怕超时） ----
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # 把用户的话存档
+            for i, msg in enumerate(messages):
+                if msg.get("role") == "system": continue
+                content = msg.get("content", "")
+                if content:
+                    try:
+                        await client.post(
+                            f"{SUPABASE_URL}/rest/v1/conversation_logs",
+                            headers={
+                                "apikey": SUPABASE_KEY,
+                                "Authorization": f"Bearer {SUPABASE_KEY}",
+                                "Prefer": "return=minimal",
+                                "Content-Type": "application/json"
+                            },
+                            json={
+                                "role": msg.get("role"),
+                                "content": content[:2000],
+                                "conversation_id": conversation_id,
+                                "message_index": i
+                            }
+                        )
+                    except Exception as e:
+                        print(f"⚠️ 存档用户消息失败: {e}")
+
+            # 把小宝的回话存档
+            if assistant_reply:
                 try:
-                    supabase.table("conversation_logs").insert({
-                        "role": role,
-                        "content": content[:2000],
-                        "conversation_id": conversation_id,
-                        "message_index": msg_index,
-                    }).execute()
-                    msg_index += 1
+                    await client.post(
+                        f"{SUPABASE_URL}/rest/v1/conversation_logs",
+                        headers={
+                            "apikey": SUPABASE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_KEY}",
+                            "Prefer": "return=minimal",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "role": "assistant",
+                            "content": assistant_reply[:2000],
+                            "conversation_id": conversation_id,
+                            "message_index": len(messages)
+                        }
+                    )
                 except Exception as e:
-                    print(f"存档出错: {e}")
+                    print(f"⚠️ 存档助手消息失败: {e}")
 
-        if assistant_reply:
-            try:
-                supabase.table("conversation_logs").insert({
-                    "role": "assistant",
-                    "content": assistant_reply[:2000],
-                    "conversation_id": conversation_id,
-                    "message_index": msg_index,
-                }).execute()
-            except Exception as e:
-                print(f"存档助手回复出错: {e}")
-
-        # ---- 构建提取上下文 ----
+        # ---- 2. 提取泡泡逻辑（跟你原来的完全一样） ----
         recent_context = ""
         collected = 0
         for msg in reversed(messages):
             role = msg.get("role", "")
             content = msg.get("content", "")
-            if role == "system":
-                continue
+            if role == "system": continue
             if content:
                 label = "刘丹" if role == "user" else "小宝"
                 recent_context = f"{label}：{content[:500]}\n" + recent_context
                 collected += 1
-                if collected >= 20:
-                    break
+                if collected >= 20: break
         recent_context += f"小宝：{assistant_reply[:600]}\n"
 
-        # ---- 提取泡泡 ----
         extract_body = {
             "model": "deepseek-v4-pro",
             "messages": [
@@ -270,6 +284,7 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
             "max_tokens": 16000,
         }
 
+        # 调用大模型提取泡泡
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{DEEPSEEK_API_BASE}/v1/chat/completions",
@@ -279,11 +294,9 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                 },
                 json=extract_body,
             )
-
             if resp.status_code == 200:
                 result = resp.json()
                 text = result["choices"][0]["message"]["content"].strip()
-
                 if text.startswith("```"):
                     lines = text.split("\n")
                     text = "\n".join(lines[1:])
@@ -297,43 +310,43 @@ async def _archive_and_extract(messages, assistant_reply, conversation_id):
                     start = text.find("[")
                     end = text.rfind("]")
                     if start >= 0 and end > start:
-                        try:
-                            bubbles = json.loads(text[start:end + 1])
-                        except json.JSONDecodeError:
-                            return
+                        bubbles = json.loads(text[start:end + 1])
                     else:
                         return
 
+                # ---- 3. 直接调用 Mem0 API 存泡泡 ----
                 for bubble in bubbles:
-                    if not isinstance(bubble, dict):
-                        continue
+                    if not isinstance(bubble, dict): continue
                     classification = bubble.get("classification", "")
                     description = bubble.get("description", "")
-                    if not description or len(description.strip()) < 5:
-                        continue
+                    if not description or len(description.strip()) < 5: continue
 
                     try:
-                        memory_data = [
-                            {"role": "user", "content": description.strip()},
-                            {"role": "assistant", "content": "已记住。"}
-                        ]
-                        memory_client.add(
-                            messages=memory_data,
-                            user_id=USER_ID,
-                            metadata={
-                                "classification": classification,
-                                "timestamp": now_ts,
-                                "conversation_id": conversation_id
+                        await client.post(
+                            "https://api.mem0.ai/v1/memories/",
+                            headers={"Authorization": f"Bearer {MEM0_API_KEY}"},
+                            json={
+                                "messages": [
+                                    {"role": "user", "content": description.strip()},
+                                    {"role": "assistant", "content": "已记住。"}
+                                ],
+                                "user_id": USER_ID,
+                                "metadata": {
+                                    "classification": classification,
+                                    "timestamp": now_ts,
+                                    "conversation_id": conversation_id
+                                }
                             }
                         )
                         print(f"💭 泡泡已存: [{classification}] {description[:60]}...")
                     except Exception as e:
-                        print(f"Mem0 存储出错: {e}")
+                        print(f"💢 泡泡存储失败: {e}")
             else:
                 print(f"泡泡提取 API 错误: {resp.status_code}")
 
     except Exception as e:
-        print(f"存档/提取流程出错: {e}")
+        # 只要出错，就只在后台打印，绝对不会再让 Chatbox 报 500！
+        print(f"❌ 后台存档/提取流程整体出错: {e}")
 
 
 @app.get("/health")
