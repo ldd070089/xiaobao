@@ -3,9 +3,8 @@ import json
 import asyncio
 from datetime import datetime, timezone
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from mem0 import MemoryClient
 import uvicorn
 
 app = FastAPI()
@@ -17,16 +16,6 @@ MEM0_API_KEY = os.environ["MEM0_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 USER_ID = "liudan"
-
-# ═══════════════ 客户端初始化（防崩延迟加载） ═══════════════
-memory_client = None
-try:
-    memory_client = MemoryClient(api_key=MEM0_API_KEY)
-    memory_client.search(query="test", filters={"user_id": USER_ID})
-    print("✅ MemoryClient 初始化成功")
-except Exception as e:
-    print(f"⚠️ MemoryClient 初始化失败 (不影响主对话): {e}")
-
 
 # ═══════════════ 小宝的系统提示词 ═══════════════
 BASE_SYSTEM_PROMPT = """你是小宝。
@@ -121,12 +110,11 @@ async def chat_completions(request: Request):
         messages = list(body.get("messages", []))
         conversation_id = str(int(datetime.now(timezone.utc).timestamp()))
 
-        # ---- 搜索泡泡池 (防多模态 List 崩溃修复) ----
+        # ---- 搜索泡泡池 (直接调用 API，绝不依赖本地编译) ----
         last_user_msg = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 raw_content = msg.get("content", "")
-                # 【兼容修复】Chatbox / LobeChat 有时会把消息发成数组（多模态格式）
                 if isinstance(raw_content, list):
                     texts = []
                     for item in raw_content:
@@ -140,23 +128,28 @@ async def chat_completions(request: Request):
                 break
 
         memories_text = ""
-        if last_user_msg and last_user_msg.strip() and memory_client:
+        if last_user_msg and last_user_msg.strip():
             try:
-                results = memory_client.search(
-                    query=last_user_msg,
-                    filters={"user_id": USER_ID}
-                )
-                if results and "results" in results:
-                    formatted = []
-                    for r in results["results"][:10]:
-                        mem_text = r.get("memory", "")
-                        meta = r.get("metadata", {})
-                        cls = meta.get("classification", "")
-                        if cls:
-                            formatted.append(f"[{cls}] {mem_text}")
-                        else:
-                            formatted.append(mem_text)
-                    memories_text = "\n".join([f"- {m}" for m in formatted])
+                async with httpx.AsyncClient() as client:
+                    # 调用 Mem0 官方搜索 API，彻底摆脱本地客户端库！
+                    resp = await client.post(
+                        "https://api.mem0.ai/v1/memories/search/",
+                        headers={"Authorization": f"Bearer {MEM0_API_KEY}"},
+                        json={"query": last_user_msg, "user_id": USER_ID, "top_k": 10}
+                    )
+                    if resp.status_code == 200:
+                        results = resp.json()
+                        if results and "results" in results:
+                            formatted = []
+                            for r in results["results"][:10]:
+                                mem_text = r.get("memory", "")
+                                meta = r.get("metadata", {})
+                                cls = meta.get("classification", "")
+                                if cls:
+                                    formatted.append(f"[{cls}] {mem_text}")
+                                else:
+                                    formatted.append(mem_text)
+                            memories_text = "\n".join([f"- {m}" for m in formatted])
             except Exception as e:
                 print(f"泡泡检索出错: {e}")
 
@@ -182,7 +175,6 @@ async def chat_completions(request: Request):
         return await _non_stream_response(deepseek_body, messages, conversation_id)
 
     except Exception as e:
-        # 全局兜底：强制返回 200，绝对不让 Chatbox 看空白！
         print(f"❗主函数捕获到严重崩溃错误: {e}")
         return JSONResponse(content={
             "id": "error_id",
@@ -252,7 +244,6 @@ async def _non_stream_response(deepseek_body, messages, conversation_id):
         return JSONResponse(content=clean_result)
 
     except Exception as e:
-        # 网络层崩溃兜底
         print(f"❗非流式函数内部严重崩溃: {e}")
         return JSONResponse(content={
             "id": "error_id",
